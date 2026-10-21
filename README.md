@@ -89,3 +89,4 @@ src/sysmon.c      Board B: trader, echo server and system monitor
 - The `socket(7)`, `udp(7)`, `poll(2)` and `clock_gettime(2)` man pages.
 - The LVGL 9 documentation, for the Linux framebuffer backend and the chart widget.
 - The NXP LKSS 2026 lab materials, on which the drivers and HAL are based.
+  
