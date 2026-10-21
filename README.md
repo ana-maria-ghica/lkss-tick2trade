@@ -57,10 +57,14 @@ The LEDs give a status reading at a glance: on the exchange, green flashes on ea
 
 Some properties of the current implementation bound what the numbers mean, and they are worth stating plainly.
 
-- **RTT resolution is limited by the UI loop on Board A.** The exchange sends ticks and reads echoes from the same 50 ms LVGL timer callback, and its socket is non-blocking. An echo that arrives within microseconds is therefore not timestamped until the next callback, so the reported RTT is dominated by the timer period rather than by the network path. Moving the receive side of Board A into a dedicated thread blocking in `poll()`, as is already done on Board B, or using kernel receive timestamps (`SO_TIMESTAMPNS`), would bring the measurement down to the scale of the actual link.
+- **Round-trip timestamps are taken in a dedicated receive thread.** Board A paces the ticks from the 50 ms UI timer, but echoes are read by a separate thread blocked in `poll()`, which timestamps each one as soon as it arrives. The UI thread only draws the samples, so the measurement is independent of the rendering loop.
+- **Timestamps are taken in userspace.** Both the send and the receive timestamps are taken by the application, so they include syscall and scheduling overhead on top of the network stack itself. Kernel receive timestamps (`SO_TIMESTAMPNS`) would remove the receive-side part of that overhead.
 - **The trader's "echo" figure covers only the send.** The value shown on Board B is the duration of the `sendto()` call that returns the packet, not the time from packet arrival to echo.
 - **The trading display is synthetic.** The price, position, PnL and BUY signal on the trader screen are derived from the sequence number for presentation purposes and do not reflect any strategy. Only the echo itself carries meaning for the measurement.
-- **Userspace timestamps.** All timestamps are taken in userspace, so they include syscall and scheduling overhead in addition to the network stack.
+
+## Changes after the hackathon
+
+The version built during the hackathon read echoes from the same 50 ms UI timer that drew the dashboard, so every round trip was reported as roughly 50 ms: the timer period, not the network. Receiving was later moved to a dedicated thread blocked in `poll()`, which timestamps each echo as soon as it arrives, and the chart scales were changed to match latencies below a millisecond. In a loopback test, the reported round trip dropped from about 50 ms to about 0.2 ms. The new version has not yet been re-measured on the boards.
 
 ## Requirements
 
