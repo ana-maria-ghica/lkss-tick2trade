@@ -1,14 +1,4 @@
 // SPDX-License-Identifier: GPL-2.0
-/*
- * RetroQuant - Host A / Exchange
- *
- * Board A:
- *   IP local: 192.168.1.101
- *   sends UDP ticks to Board B / Trader: 192.168.1.100:5000
- *
- * Board B must echo every packet back.
- */
-
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
