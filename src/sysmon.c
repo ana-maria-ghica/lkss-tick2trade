@@ -237,20 +237,10 @@ static void *net_thread(void *arg)
 
                 unsigned int total = atomic_fetch_add(&total_packets, 1) + 1;
 
-                /*
-                 * Strategie fake, vizuală:
-                 * o dată la 20 pachete => EXEC BUY.
-                 * Dacă A trimite la 50 ms, asta înseamnă cam o dată/secundă.
-                 */
                 if (total % 20 == 0)
                     atomic_store(&strategy_ttl, 4);
             }
         }
-
-        /*
-         * În busy poll nu dormim intenționat:
-         * vrem să se vadă CPU mare, ca diferență față de poll/blocking.
-         */
     }
 
     return NULL;
