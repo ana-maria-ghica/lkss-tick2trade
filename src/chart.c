@@ -2,6 +2,8 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -13,11 +15,15 @@
 #include "hal.h"
 #include "hackpad.h"
 
+// ip address of board b (trader); check it with `ip addr` on board b
 #define TRADER_IP "192.168.1.101"
 #define UDP_PORT 5000
 
 #define POINTS 60
 #define SEQ_TABLE_SIZE 1024
+
+// rtt samples waiting to be drawn on the chart by the ui thread
+#define RTT_QUEUE_SIZE 256
 
 struct tick_packet {
 	uint32_t seq;
@@ -31,6 +37,11 @@ static lv_obj_t *help_lbl;
 
 static int udp_fd = -1;
 static struct sockaddr_in trader_addr;
+static pthread_t rx_tid;
+
+// shared between the ui thread (sends ticks, draws) and the receive thread
+// (timestamps echoes); everything below is protected by stats_lock
+static pthread_mutex_t stats_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static uint32_t seq_no = 1;
 static uint32_t tx_count;
@@ -44,15 +55,22 @@ static uint32_t min_us = 0xffffffff;
 static uint32_t max_us;
 static uint64_t sum_us;
 
-static bool paused;
-static int scale_idx = 1;
+static uint32_t rtt_queue[RTT_QUEUE_SIZE];
+static int rtt_head, rtt_tail;
 
-/* chart scale in microseconds */
+static bool rx_error;
+
+// owned by the ui thread only
+static bool paused;
+static int scale_idx = 2;
+
+// chart scale in microseconds
 static const int scales_us[] = {
-	5000,   /* 5 ms */
-	10000,  /* 10 ms */
-	25000,  /* 25 ms */
-	50000,  /* 50 ms */
+	200,    // 0.2 ms
+	500,    // 0.5 ms
+	1000,   // 1 ms
+	5000,   // 5 ms
+	50000,  // 50 ms
 };
 
 static int green_ttl;
@@ -92,6 +110,7 @@ static void net_init(void)
 		return;
 	}
 
+	// non-blocking, so the receive thread can drain the socket after poll() wakes it up
 	int flags = fcntl(udp_fd, F_GETFL, 0);
 	fcntl(udp_fd, F_SETFL, flags | O_NONBLOCK);
 
@@ -107,8 +126,90 @@ static void net_init(void)
 	}
 }
 
+// receive thread: sleeps in poll() and timestamps every echo the moment it is read,
+// so the measured rtt no longer depends on the 50 ms ui timer
+static void *rx_thread(void *arg)
+{
+	(void)arg;
+
+	struct pollfd pfd = {
+		.fd = udp_fd,
+		.events = POLLIN,
+		.revents = 0,
+	};
+
+	while (1) {
+		if (poll(&pfd, 1, -1) <= 0)
+			continue;
+
+		while (1) {
+			struct tick_packet pkt;
+			struct sockaddr_in src;
+			socklen_t slen = sizeof(src);
+
+			ssize_t n = recvfrom(udp_fd, &pkt, sizeof(pkt), 0,
+					     (struct sockaddr *)&src, &slen);
+
+			// take the timestamp first, before any other work
+			uint64_t t_recv = now_us();
+
+			if (n < 0) {
+				if (errno == EAGAIN || errno == EWOULDBLOCK)
+					break;
+
+				perror("recvfrom");
+				pthread_mutex_lock(&stats_lock);
+				rx_error = true;
+				pthread_mutex_unlock(&stats_lock);
+				break;
+			}
+
+			if (n != sizeof(pkt))
+				continue;
+
+			pthread_mutex_lock(&stats_lock);
+
+			uint32_t idx = pkt.seq % SEQ_TABLE_SIZE;
+
+			if (pkt.seq != 0 && seq_table[idx] == pkt.seq) {
+				uint64_t rtt = t_recv - send_time_us[idx];
+
+				if (rtt > 999999)
+					rtt = 999999;
+
+				// count each tick once, even if the echo is duplicated
+				seq_table[idx] = 0;
+
+				last_rtt_us = (uint32_t)rtt;
+
+				if (last_rtt_us < min_us)
+					min_us = last_rtt_us;
+
+				if (last_rtt_us > max_us)
+					max_us = last_rtt_us;
+
+				sum_us += last_rtt_us;
+				rx_count++;
+
+				// hand the sample to the ui thread (lvgl is not thread-safe)
+				int next = (rtt_head + 1) % RTT_QUEUE_SIZE;
+				if (next != rtt_tail) {
+					rtt_queue[rtt_head] = last_rtt_us;
+					rtt_head = next;
+				}
+			}
+
+			pthread_mutex_unlock(&stats_lock);
+		}
+	}
+
+	return NULL;
+}
+
 static void reset_stats(void)
 {
+	pthread_mutex_lock(&stats_lock);
+
 	tx_count = 0;
 	rx_count = 0;
 
@@ -122,6 +223,11 @@ static void reset_stats(void)
 	memset(seq_table, 0, sizeof(seq_table));
 	memset(send_time_us, 0, sizeof(send_time_us));
 
+	rtt_head = 0;
+	rtt_tail = 0;
+
+	pthread_mutex_unlock(&stats_lock);
+
 	lv_chart_set_all_value(chart, ser, 0);
 	lv_chart_refresh(chart);
 
@@ -131,10 +237,13 @@ static void reset_stats(void)
 
 static void send_tick(void)
 {
-	if (udp_fd < 0 || paused)
+	if (udp_fd < 0)
 		return;
 
 	struct tick_packet pkt;
+
+	// record the send time before sendto(), so even a very fast echo finds it
+	pthread_mutex_lock(&stats_lock);
 
 	pkt.seq = seq_no++;
 
@@ -143,63 +252,18 @@ static void send_tick(void)
 	seq_table[idx] = pkt.seq;
 	send_time_us[idx] = now_us();
 
+	pthread_mutex_unlock(&stats_lock);
+
 	ssize_t n = sendto(udp_fd, &pkt, sizeof(pkt), 0,
 			   (struct sockaddr *)&trader_addr,
 			   sizeof(trader_addr));
 
-	if (n == sizeof(pkt))
+	if (n == sizeof(pkt)) {
+		pthread_mutex_lock(&stats_lock);
 		tx_count++;
-	else
+		pthread_mutex_unlock(&stats_lock);
+	} else {
 		red_ttl = 4;
-}
-
-static void recv_echoes(void)
-{
-	if (udp_fd < 0)
-		return;
-
-	while (1) {
-		struct tick_packet pkt;
-		struct sockaddr_in src;
-		socklen_t slen = sizeof(src);
-
-		ssize_t n = recvfrom(udp_fd, &pkt, sizeof(pkt), 0,
-				     (struct sockaddr *)&src, &slen);
-
-		if (n < 0) {
-			if (errno == EAGAIN || errno == EWOULDBLOCK)
-				break;
-
-			perror("recvfrom");
-			red_ttl = 4;
-			break;
-		}
-
-		if (n == sizeof(pkt)) {
-			uint32_t idx = pkt.seq % SEQ_TABLE_SIZE;
-
-			if (seq_table[idx] == pkt.seq) {
-				uint64_t rtt = now_us() - send_time_us[idx];
-
-				if (rtt > 999999)
-					rtt = 999999;
-
-				last_rtt_us = (uint32_t)rtt;
-
-				if (last_rtt_us < min_us)
-					min_us = last_rtt_us;
-
-				if (last_rtt_us > max_us)
-					max_us = last_rtt_us;
-
-				sum_us += last_rtt_us;
-				rx_count++;
-
-				lv_chart_set_next_value(chart, ser, last_rtt_us);
-
-				green_ttl = 3;
-			}
-		}
 	}
 }
 
@@ -296,17 +360,48 @@ static void update_timer(lv_timer_t *t)
 	}
 
 	if (hal_button_pressed(HACKPAD_BTN_SW4)) {
-		/* manual tick */
+		// manual tick
 		send_tick();
 	}
 
-	recv_echoes();
-
+	// the timer only paces the ticks (one every 50 ms); the rtt is measured by rx_thread
 	if (!paused)
 		send_tick();
 
-	uint32_t avg_us = rx_count ? (uint32_t)(sum_us / rx_count) : 0;
-	uint32_t loss = tx_count > rx_count ? tx_count - rx_count : 0;
+	// take the new samples and a consistent copy of the stats
+	uint32_t samples[RTT_QUEUE_SIZE];
+	int nsamples = 0;
+
+	pthread_mutex_lock(&stats_lock);
+
+	while (rtt_tail != rtt_head) {
+		samples[nsamples++] = rtt_queue[rtt_tail];
+		rtt_tail = (rtt_tail + 1) % RTT_QUEUE_SIZE;
+	}
+
+	uint32_t tx = tx_count;
+	uint32_t rx = rx_count;
+	uint32_t last = last_rtt_us;
+	uint32_t min = min_us;
+	uint32_t max = max_us;
+	uint64_t sum = sum_us;
+	bool error = rx_error;
+	rx_error = false;
+
+	pthread_mutex_unlock(&stats_lock);
+
+	// lvgl calls stay in the ui thread
+	for (int i = 0; i < nsamples; i++)
+		lv_chart_set_next_value(chart, ser, samples[i]);
+
+	if (nsamples > 0)
+		green_ttl = 3;
+
+	if (error)
+		red_ttl = 4;
+
+	uint32_t avg_us = rx ? (uint32_t)(sum / rx) : 0;
+	uint32_t loss = tx > rx ? tx - rx : 0;
 
 	if (loss > 20)
 		red_ttl = 2;
@@ -320,16 +415,16 @@ static void update_timer(lv_timer_t *t)
 		 "MIN %6u us\n"
 		 "AVG %6u us\n"
 		 "MAX %6u us\n"
-		 "SCALE %2d ms  %s",
+		 "SCALE %5d us  %s",
 		 TRADER_IP,
-		 tx_count,
-		 rx_count,
+		 tx,
+		 rx,
 		 loss,
-		 last_rtt_us,
-		 min_us == 0xffffffff ? 0 : min_us,
+		 last,
+		 min == 0xffffffff ? 0 : min,
 		 avg_us,
-		 max_us,
-		 scales_us[scale_idx] / 1000,
+		 max,
+		 scales_us[scale_idx],
 		 paused ? "PAUSED" : "LIVE");
 
 	lv_label_set_text(stats_lbl, buf);
@@ -352,6 +447,15 @@ int main(void)
 	create_ui();
 
 	net_init();
+
+	// start the receive thread once the socket exists
+	if (udp_fd >= 0) {
+		if (pthread_create(&rx_tid, NULL, rx_thread, NULL) != 0) {
+			perror("pthread_create");
+		} else {
+			pthread_detach(rx_tid);
+		}
+	}
 
 	lv_timer_create(update_timer, 50, NULL);
 
